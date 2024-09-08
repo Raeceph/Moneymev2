@@ -19,7 +19,7 @@ class Config:
     # Ollama configuration
     OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    OLLAMA_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "mistral")
+    OLLAMA_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "llama3")
 
     # Embedding model configuration
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers")

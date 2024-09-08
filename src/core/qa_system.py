@@ -15,6 +15,8 @@ import structlog
 from src.utils.logging_configs import configure_logging
 
 configure_logging()
+
+
 logger = structlog.get_logger(__name__)
 
 
@@ -132,6 +134,8 @@ class QASystem:
             if not await self.vector_store_service.is_loaded():
                 logger.info("Creating new vector store", pdf_path=pdf_path)
                 pdf_parser = PDFParser(pdf_path)
+
+                print ("----------------------------------------------------------------------------------"+pdf_path)
                 sections_with_metadata = (
                     await pdf_parser.extract_sections_with_metadata()
                 )

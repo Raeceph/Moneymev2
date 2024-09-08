@@ -1,16 +1,15 @@
 import logging
 import structlog
 
-
 def configure_logging():
     # Set up basic logging configuration to a file
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,  # Change DEBUG to INFO or WARNING
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
             logging.FileHandler("app.log"),  # Log output to app.log
             logging.StreamHandler(),  # Log output to console
-        ],
+        ]
     )
 
     structlog.configure(

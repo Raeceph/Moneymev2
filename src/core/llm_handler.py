@@ -123,7 +123,6 @@ class LLMHandler:
 
         return prompt
 
-
     def _format_context(self, context_data):
         """Formats context data into readable sections of text."""
         formatted_context = ""
@@ -134,13 +133,15 @@ class LLMHandler:
                 )
             elif item["type"] == "table":
                 # Ensure that all headers are strings, replace None with empty strings if necessary
-                headers = [str(header) if header is not None else "" for header in item.get("headers", [])]
+                headers = [
+                    str(header) if header is not None else ""
+                    for header in item.get("headers", [])
+                ]
                 formatted_context += f"Table:\nHeaders: {', '.join(headers)}\n"
                 for row in item["data"]:
                     formatted_context += f"{', '.join(map(str, row))}\n"
                 formatted_context += "\n"
         return formatted_context
-
 
     def _evaluate_answer_quality(self, answer: str, context: str = None) -> int:
         """Evaluates the quality of the generated answer based on multiple factors."""
