@@ -1,0 +1,1581 @@
+# config.py
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+class Config:
+    """Configuration class for the QA system."""
+
+    # General LLM provider configuration
+    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
+
+    # OpenAI configuration
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
+    OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "gpt-3.5-turbo")
+
+    # Ollama configuration
+    OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "mistral")
+
+    # Embedding model configuration
+    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers")
+    EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "paraphrase-MiniLM-L6-v2")
+
+    # Vector store configuration
+    VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", "./vector_store/faiss_index")
+    UPLOAD_DIRECTORY = os.getenv("UPLOAD_DIRECTORY", "./uploads")
+
+    # New configuration options
+    CHAIN_OF_THOUGHTS_ENABLED = (
+        os.getenv("CHAIN_OF_THOUGHTS_ENABLED", "False").lower() == "true"
+    )
+    CHAIN_OF_THOUGHTS_PROMPT = os.getenv("CHAIN_OF_THOUGHTS_PROMPT", "").split("|")
+    EXAMPLE_PROMPTS = (
+        os.getenv("EXAMPLE_PROMPTS", "").split("|")
+        if os.getenv("EXAMPLE_PROMPTS")
+        else []
+    )
+
+# Create a global instance of the Config class
+config = Config()
+
+# Create necessary directories
+os.makedirs(config.VECTOR_STORE_PATH, exist_ok=True)
+os.makedirs(config.UPLOAD_DIRECTORY, exist_ok=True)
+# __init__.py
+
+# cli_app.py
+import argparse
+import sys
+import os
+from src.config import Config
+from src.core.qa_system import QASystem
+from src.utils.error_handler import QASystemError
+import uuid
+import shutil
+
+# Add the project root to the Python path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, project_root)
+
+def main():
+    """Main function for handling CLI input and managing QA system operations."""
+
+    config = Config()
+    qa_system = QASystem(config)
+
+    os.makedirs(config.UPLOAD_DIRECTORY, exist_ok=True)
+    os.makedirs(config.VECTOR_STORE_PATH, exist_ok=True)
+
+    # Attempt to load existing vector store on startup
+    try:
+        last_pdf = qa_system.get_last_pdf()
+        if last_pdf and qa_system.vector_store_service.vector_store_exists(
+            config.VECTOR_STORE_PATH
+        ):
+            qa_system.vector_store_service.load_vector_store(config.VECTOR_STORE_PATH)
+            print(f"Loaded existing vector store. Last processed PDF: {last_pdf}")
+        else:
+            print("No existing vector store found. Please upload a PDF.")
+    except Exception as e:
+        print(f"Error loading vector store: {str(e)}")
+
+    parser = argparse.ArgumentParser(description="QA System CLI")
+    parser.add_argument(
+        "--mode",
+        choices=["query", "chat", "list", "upload"],
+        required=True,
+        help="Operation mode",
+    )
+    parser.add_argument("--pdf", help="Path to the PDF file (required for upload mode)")
+    parser.add_argument("--question", help="Question to ask (for query mode)")
+    args = parser.parse_args()
+
+    if args.mode == "upload":
+        if not args.pdf:
+            print("Error: --pdf is required for upload mode")
+            sys.exit(1)
+        
+        # Handle file paths for Docker environment
+        if args.pdf.startswith('/external_pdfs/'):
+            pdf_path = args.pdf
+        else:
+            pdf_path = os.path.join('/external_pdfs', args.pdf)
+        
+        if not os.path.exists(pdf_path):
+            print(f"Error: File not found: {pdf_path}")
+            sys.exit(1)
+        
+        try:
+            original_filename = os.path.basename(pdf_path)
+            destination_path = os.path.join(config.UPLOAD_DIRECTORY, original_filename)
+            shutil.copy2(pdf_path, destination_path)
+            qa_system.load_or_create_vector_store(destination_path, original_filename)
+            print(f"Document successfully uploaded and processed: {original_filename}")
+        except QASystemError as e:
+            print(f"Error uploading document: {str(e)}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Unexpected error: {str(e)}")
+            sys.exit(1)
+
+    elif args.mode == "query":
+        if not args.question:
+            print("Error: --question is required for query mode")
+            sys.exit(1)
+
+        try:
+            if not qa_system.vector_store_service.is_loaded():
+                print(
+                    "Error: No PDF has been processed yet. Please upload a PDF first."
+                )
+                sys.exit(1)
+            result = qa_system.process_single_query(args.question)
+            print(f"Answer: {result['answer']}")
+            print(f"Source: {result['source']}")
+            print(f"Quality Score: {result['quality_score']}")
+        except QASystemError as e:
+            print(f"Error: {str(e)}")
+            sys.exit(1)
+
+    elif args.mode == "chat":
+        try:
+            if not qa_system.vector_store_service.is_loaded():
+                print(
+                    "Error: No PDF has been processed yet. Please upload a PDF first."
+                )
+                sys.exit(1)
+            session_id = str(uuid.uuid4())
+            print("Chat mode. Type 'exit' to end the conversation.")
+            while True:
+                question = input("You: ")
+                if question.lower() == "exit":
+                    break
+                try:
+                    result = qa_system.process_chat_query(session_id, question)
+                    print(f"AI: {result['answer']}")
+                except QASystemError as e:
+                    print(f"Error: {str(e)}")
+                    break
+        except QASystemError as e:
+            print(f"Error: {str(e)}")
+            sys.exit(1)
+
+    elif args.mode == "list":
+        try:
+            documents = qa_system.list_documents()
+            print("Processed documents:")
+            for doc in documents:
+                print(doc)
+        except QASystemError as e:
+            print(f"Error listing documents: {str(e)}")
+            sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+# pdf_parser.py
+import pdfplumber
+import json
+from typing import List, Dict, Any
+from src.core.custom_text_splitter import MetadataTextSplitter
+import structlog
+from src.utils.logging_configs import configure_logging
+import asyncio
+
+configure_logging()
+logger = structlog.get_logger(__name__)
+
+class PDFParser:
+    """Parses PDF files, extracting content and metadata."""
+
+    def __init__(self, pdf_path: str):
+        """Initializes the PDFParser with the path to the PDF file."""
+        self.pdf_path = pdf_path
+        self.headers = []
+
+    async def extract_content(self) -> List[Dict[str, Any]]:
+        """Extracts content from the PDF, including text and tables."""
+        try:
+            content = await asyncio.to_thread(self._extract_content_sync)
+            return content
+        except Exception as e:
+            logger.error("Error extracting content from PDF", error=str(e), pdf_path=self.pdf_path)
+            raise
+
+    def _extract_content_sync(self) -> List[Dict[str, Any]]:
+        """Synchronous method to extract content from the PDF."""
+        content = []
+        with pdfplumber.open(self.pdf_path) as pdf:
+            for page in pdf.pages:
+                page_content = self._process_page(page)
+                content.extend(page_content)
+        return content
+
+    def _process_page(self, page) -> List[Dict[str, Any]]:
+        """Processes a single PDF page to extract text and tables."""
+        page_content = []
+        text = page.extract_text()
+        tables = page.extract_tables()
+
+        # Process text content
+        lines = text.split("\n")
+        current_header = ""
+        current_text = []
+
+        for line in lines:
+            if self._is_header(line):
+                if current_text:
+                    page_content.append(
+                        {
+                            "type": "text",
+                            "header": current_header,
+                            "content": "\n".join(current_text),
+                        }
+                    )
+                    current_text = []
+                current_header = line
+                self.headers.append(line)
+            else:
+                current_text.append(line)
+
+        # Add any remaining text
+        if current_text:
+            page_content.append(
+                {
+                    "type": "text",
+                    "header": current_header,
+                    "content": "\n".join(current_text),
+                }
+            )
+
+        # Process tables
+        for table in tables:
+            table_dict = self._process_table(table)
+            page_content.append(table_dict)
+
+        return page_content
+
+    def _is_header(self, line: str) -> bool:
+        """Determines if a line of text is a header based on format."""
+        return line.isupper() or line.strip().split(".")[0].isdigit()
+
+    def _process_table(self, table: List[List[str]]) -> Dict[str, Any]:
+        """Processes a table from the PDF and formats it as a dictionary."""
+        headers = table[0]
+        data = table[1:]
+        return {"type": "table", "headers": headers, "data": data}
+
+    async def extract_sections_with_metadata(self) -> List[Dict[str, Any]]:
+        """Extracts sections of text and tables, splitting them into manageable chunks with metadata."""
+        try:
+            content = await self.extract_content()
+            chunks = []
+
+            text_splitter = MetadataTextSplitter(chunk_size=1000, chunk_overlap=200)
+
+            for item in content:
+                if item["type"] == "text":
+                    text_chunks = text_splitter.split_text_with_metadata(
+                        item["content"], {"type": "text", "header": item["header"]}
+                    )
+                    chunks.extend(text_chunks)
+                elif item["type"] == "table":
+                    # Store the entire table as a single chunk
+                    chunks.append(
+                        {
+                            "content": json.dumps(item["data"]),
+                            "metadata": {"type": "table", "headers": item["headers"]},
+                        }
+                    )
+
+            return chunks
+        except Exception as e:
+            logger.error("Error extracting sections with metadata", error=str(e), pdf_path=self.pdf_path)
+            raise
+# document_service.py
+import os
+import logging
+from typing import List
+from src.config import Config
+from src.core.document_tracker import DocumentTracker
+from src.core.pdf_parser import PDFParser
+
+import structlog
+from src.utils.logging_configs import configure_logging
+from src.utils.error_handler import DocumentProcessingError
+import asyncio
+import aiofiles  
+
+configure_logging()
+logger = structlog.get_logger(__name__)
+
+class DocumentService:
+    """Service for managing document processing, tracking, and retrieval."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.document_tracker = DocumentTracker()
+        # Call async init method explicitly
+        asyncio.create_task(self.document_tracker.initialize())
+        self.last_pdf_file = os.path.join(os.path.expanduser("~"), "last_pdf.txt")
+
+    async def process_document(self, pdf_path: str, original_filename: str) -> List[dict]:
+        """
+        Process a PDF document, extract its sections, and track it.
+
+        Args:
+            pdf_path (str): The file path of the PDF.
+            original_filename (str): The original filename of the PDF.
+
+        Returns:
+            List[dict]: A list of sections with metadata extracted from the PDF.
+        """
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+
+        if not pdf_path.lower().endswith(".pdf"):
+            raise ValueError("The file must be a PDF")
+
+        if await self.is_document_processed(pdf_path):
+            logger.info("Document already processed", filename=original_filename)
+            return []
+
+        try:
+            pdf_parser = PDFParser(pdf_path)
+            sections_with_metadata = await pdf_parser.extract_sections_with_metadata()
+
+            await self.document_tracker.add_document(pdf_path, original_filename)
+            await self._save_last_pdf(pdf_path)
+
+            logger.info("Document successfully processed", filename=original_filename)
+            return sections_with_metadata
+        except Exception as e:
+            logger.error("Error processing document", filename=original_filename, error=str(e))
+            raise
+
+    async def list_documents(self) -> List[str]:
+        """
+        Retrieves the names of all processed documents.
+
+        Returns:
+            List[str]: A list of all processed document names.
+        """
+        try:
+            return await self.document_tracker.get_all_documents()
+        except Exception as e:
+            logger.exception("Error retrieving document list")
+            logger.error("Error details", error_message=str(e))
+            raise DocumentProcessingError(f"Error retrieving document list: {str(e)}")
+
+    async def get_last_processed_pdf(self) -> str:
+        """
+        Get the path of the last processed PDF.
+
+        Returns:
+            str: The path of the last processed PDF, or None if no PDF has been processed.
+        """
+        if os.path.exists(self.last_pdf_file):
+            async with aiofiles.open(self.last_pdf_file, "r") as f:
+                content = await f.read()  # Await the read operation first
+                return content.strip()     # Now call strip on the result
+        return None
+
+    async def _save_last_pdf(self, pdf_path: str):
+        """
+        Save the path of the last processed PDF.
+
+        Args:
+            pdf_path (str): The path of the PDF to save.
+        """
+        async with aiofiles.open(self.last_pdf_file, "w") as f:
+            await f.write(pdf_path)
+
+    async def is_document_processed(self, pdf_path: str) -> bool:
+        """
+        Check if a document has already been processed.
+
+        Args:
+            pdf_path (str): The path of the PDF to check.
+
+        Returns:
+            bool: True if the document has been processed, False otherwise.
+        """
+        return await self.document_tracker.is_document_processed(pdf_path)
+
+    async def add_document(self, pdf_path: str, original_filename: str):
+        """
+        Add a processed document to the tracker.
+
+        Args:
+            pdf_path (str): The path of the processed PDF.
+            original_filename (str): The original filename of the PDF.
+        """
+        await self.document_tracker.add_document(pdf_path, original_filename)
+        await self._save_last_pdf(pdf_path)
+        logger.info("Document added to tracker", filename=original_filename)
+# custom_text_splitter.py
+# src/core/custom_text_splitter.py
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from typing import List, Dict, Any
+
+
+class MetadataTextSplitter(RecursiveCharacterTextSplitter):
+    """A custom text splitter that splits text into chunks while preserving associated metadata."""
+
+    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
+        """
+        Initialize the MetadataTextSplitter with chunk size and overlap.
+
+        Args:
+            chunk_size (int): The size of each text chunk.
+            chunk_overlap (int): The overlap between consecutive chunks.
+        """
+        super().__init__(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+    def split_text_with_metadata(
+        self, text: str, metadata: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        Split text into chunks and associate each chunk with metadata.
+
+        Args:
+            text (str): The input text to split.
+            metadata (Dict[str, Any]): Metadata to associate with each chunk of text.
+
+        Returns:
+            List[Dict[str, Any]]: A list of dictionaries where each dictionary contains
+                                  a chunk of text and its associated metadata.
+        """
+        chunks = []
+        split_texts = self.split_text(text)
+        for chunk in split_texts:
+            chunks.append({"content": chunk, "metadata": metadata.copy()})
+        return chunks
+
+# vector_store_service.py
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.docstore.document import Document
+from cachetools import TTLCache, cached
+from typing import List, Dict, Any
+from src.config import Config
+import warnings
+import logging
+import json
+import os
+import asyncio
+
+import structlog
+from src.utils.logging_configs import configure_logging
+
+configure_logging()
+logger = structlog.get_logger(__name__)
+
+# Suppress the LangChainDeprecationWarning and huggingface warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+class VectorStoreService:
+    """Service for managing the creation, loading, and querying of the vector store."""
+
+    def __init__(self, config: Config):
+        """Initializes the VectorStoreService with configuration and embeddings."""
+        self.config = config
+        self.embeddings = HuggingFaceEmbeddings(model_name=config.EMBEDDING_MODEL_NAME)
+        self.vector_store = None
+        self.query_cache = TTLCache(maxsize=100, ttl=3600)  
+
+    async def vector_store_exists(self, path: str) -> bool:
+        """Check if the vector store files exist at the given path."""
+        index_file = os.path.join(path, "index.faiss")
+        pkl_file = os.path.join(path, "index.pkl")
+        return os.path.exists(index_file) and os.path.exists(pkl_file)
+
+    async def is_loaded(self) -> bool:
+        """Check if the vector store is loaded."""
+        return (
+            self.vector_store is not None
+            and len(self.vector_store.index_to_docstore_id) > 0
+        )
+
+    async def create_vector_store(self, chunks_with_metadata: List[Dict[str, Any]]):
+        """Creates a vector store from a list of text chunks with metadata."""
+        documents = []
+        for chunk in chunks_with_metadata:
+            try:
+                metadata = chunk.get("metadata", {})
+                if metadata.get("type") == "text":
+                    doc = Document(
+                        page_content=chunk.get("content", ""),
+                        metadata={"type": "text", "header": metadata.get("header", "")},
+                    )
+                elif metadata.get("type") == "table":
+                    doc = Document(
+                        page_content=chunk.get("content", "{}"),
+                        metadata={
+                            "type": "table",
+                            "headers": metadata.get("headers", []),
+                        },
+                    )
+                else:
+                    logger.warning("Unknown chunk type", chunk_type=metadata.get("type"))
+                    continue
+                documents.append(doc)
+            except Exception as e:
+                logger.error("Error processing chunk", error=str(e), chunk=chunk)
+
+        if not documents:
+            raise ValueError("No valid documents to create vector store")
+
+        self.vector_store = await FAISS.afrom_documents(documents, self.embeddings)
+        logger.info("Created vector store", document_count=len(documents))
+
+    async def save_vector_store(self, path: str):
+        """Saves the vector store to the specified local path."""
+        if self.vector_store is None:
+            raise ValueError("Vector store has not been created yet.")
+        os.makedirs(path, exist_ok=True)
+        await asyncio.to_thread(self.vector_store.save_local, path)
+        logger.info("Vector store saved", path=path)
+        
+
+    async def load_vector_store(self, path: str):
+        """Loads the vector store from the specified local path."""
+        try:
+            # Check if the vector store exists before trying to load it
+            if not await self.vector_store_exists(path):
+                raise FileNotFoundError(f"No vector store found at {path}")
+            
+            # Use asyncio.to_thread to call the synchronous FAISS load_local method asynchronously
+            self.vector_store = await asyncio.to_thread(
+                FAISS.load_local, path, self.embeddings,allow_dangerous_deserialization=True
+            )
+            
+            logger.info("Vector store loaded successfully", path=path)
+        except Exception as e:
+            logger.error("Error loading vector store", error=str(e))
+            raise
+
+    async def query(self, query_text: str) -> str:
+        """Queries the vector store with a text input and returns the results."""
+        if query_text in self.query_cache:
+            logger.info("Query result found in cache", query_text=query_text)
+            return self.query_cache[query_text]
+
+        if self.vector_store is None:
+            logger.error("Vector store not created or loaded")
+            raise ValueError("Vector store has not been created or loaded yet.")
+
+        logger.info("Querying vector store", query_text=query_text)
+        results = await self.vector_store.asimilarity_search(query_text, k=3)
+        processed_results = []
+
+        for doc in results:
+            try:
+                if doc.metadata.get("type") == "text":
+                    processed_results.append(
+                        {
+                            "type": "text",
+                            "content": doc.page_content,
+                            "header": doc.metadata.get("header", ""),
+                        }
+                    )
+                elif doc.metadata.get("type") == "table":
+                    processed_results.append(
+                        {
+                            "type": "table",
+                            "headers": doc.metadata.get("headers", []),
+                            "data": (
+                                json.loads(doc.page_content)
+                                if isinstance(doc.page_content, str)
+                                else doc.page_content
+                            ),
+                        }
+                    )
+                else:
+                    logger.warning("Unknown document type", doc_type=doc.metadata.get("type"))
+                    processed_results.append(
+                        {"type": "unknown", "content": doc.page_content}
+                    )
+            except json.JSONDecodeError:
+                logger.error("Failed to parse JSON for document", metadata=doc.metadata)
+            except Exception as e:
+                logger.error("Error processing document", error=str(e))
+
+        # Cache the query results
+        self.query_cache[query_text] = json.dumps(processed_results)
+
+        logger.debug("Processed query results", results=processed_results)
+        return json.dumps(processed_results)
+
+
+    async def load_or_create_vector_store(self, pdf_path: str):
+        """Loads or creates a vector store from the PDF located at the given path."""
+        vector_store_path = self.config.VECTOR_STORE_PATH
+        if await self.vector_store_exists(vector_store_path):
+            await self.load_vector_store(vector_store_path)
+        else:
+            from src.core.pdf_parser import PDFParser
+
+            pdf_parser = PDFParser(pdf_path)
+            sections_with_metadata = await pdf_parser.extract_sections_with_metadata()
+            await self.create_vector_store(sections_with_metadata)
+            await self.save_vector_store(vector_store_path)
+        logger.info("Vector store loaded or created", pdf_path=pdf_path)
+# __init__.py
+
+# qa_system.py
+import logging
+import uuid
+import os
+from src.config import Config
+from src.core.vector_store_service import VectorStoreService
+from src.core.document_service import DocumentService
+from src.core.llm_handler import LLMHandler
+from src.core.conversation_manager import ConversationManager
+from src.utils.error_handler import handle_errors, QASystemError
+from src.core.pdf_parser import PDFParser
+import asyncio
+import aiofiles
+
+import structlog
+from src.utils.logging_configs import configure_logging
+
+configure_logging()
+logger = structlog.get_logger(__name__)
+
+class QASystem:
+    """Handles the question-answer system, including document and conversation management."""
+
+    def __init__(self, config: Config):
+        """Initializes QASystem with config, vector store, document service, and LLM handler."""
+        self.config = config
+        self.vector_store_service = VectorStoreService(config)
+        self.document_service = DocumentService(config)
+        self.llm_handler = LLMHandler(config)
+        self.conversation_manager = ConversationManager()
+
+    @handle_errors
+    async def process_single_query(self, question: str, pdf_path: str = None) -> dict:
+        try:
+            await self._ensure_vector_store_loaded(pdf_path)
+
+            if not await self.vector_store_service.is_loaded():
+                raise QASystemError("Vector store is not loaded. Please upload a PDF first.")
+
+            context = await self.vector_store_service.query(question)
+            logger.debug("Context retrieved", context=context)
+
+            result = await self.llm_handler.generate_response(None, context, question)
+            logger.debug("LLM response", result=result)
+
+            if "answer" not in result:
+                raise QASystemError("LLM response missing 'answer' key.")
+
+            return {
+                "answer": result["answer"],
+                "source": result["source"],
+                "quality_score": result["quality_score"],
+            }
+
+        except QASystemError as e:
+            logger.error(f"QASystemError in process_single_query: {str(e)}")
+            raise
+        except Exception as e:
+            logger.exception(f"Unexpected error in process_single_query: {str(e)}")
+            raise QASystemError(f"An unexpected error occurred: {str(e)}")
+
+
+    @handle_errors
+    async def process_chat_query(
+        self, session_id: str, question: str, pdf_path: str = None
+    ) -> dict:
+        try:
+            await self._ensure_vector_store_loaded(pdf_path)
+
+            context = await self.vector_store_service.query(question)
+            logger.debug("Context retrieved", context=context)
+
+            if not session_id:
+                session_id = str(uuid.uuid4())
+            else:
+                try:
+                    uuid.UUID(session_id)
+                except ValueError:
+                    logger.error("Invalid session ID", session_id=session_id)
+                    raise QASystemError("Invalid session ID format")
+
+            result = await self.llm_handler.generate_response(session_id, context, question)
+            logger.debug("LLM response", result=result)
+
+            if "error" in result:
+                raise QASystemError(result["error"])
+
+            # Use synchronous calls for add_message, as they don't require await
+            self.conversation_manager.add_message(session_id, "user", question)
+            self.conversation_manager.add_message(session_id, "assistant", result["answer"])
+
+            conversation_history = self.conversation_manager.get_conversation_history(
+                session_id
+            )
+
+            return {
+                "session_id": session_id,
+                "answer": result["answer"],
+                "source": result["source"],
+                "quality_score": result["quality_score"],
+                "conversation_history": conversation_history,
+            }
+        except QASystemError as e:
+            logger.error("QASystemError in process_chat_query", error=str(e))
+            raise
+        except Exception as e:
+            logger.exception("Unexpected error in process_chat_query", error=str(e))
+            raise QASystemError(f"An unexpected error occurred: {str(e)}")
+
+
+    async def _ensure_vector_store_loaded(self, pdf_path: str = None):
+        if pdf_path:
+            await self.load_or_create_vector_store(pdf_path, os.path.basename(pdf_path))
+        elif not await self.vector_store_service.is_loaded():
+            last_pdf = await self.document_service.get_last_processed_pdf()
+            if last_pdf and await self.vector_store_service.vector_store_exists(
+                self.config.VECTOR_STORE_PATH
+            ):
+                await self.vector_store_service.load_vector_store(
+                    self.config.VECTOR_STORE_PATH
+                )
+            else:
+                raise QASystemError("No vector store found. Please upload a PDF first.")
+
+    @handle_errors
+    async def load_or_create_vector_store(self, pdf_path: str, original_filename: str):
+        try:
+            if not await self.vector_store_service.is_loaded():
+                logger.info("Creating new vector store", pdf_path=pdf_path)
+                pdf_parser = PDFParser(pdf_path)
+                sections_with_metadata = await pdf_parser.extract_sections_with_metadata()
+                await self.vector_store_service.create_vector_store(sections_with_metadata)
+                await self.vector_store_service.save_vector_store(self.config.VECTOR_STORE_PATH)
+                await self.document_service.add_document(pdf_path, original_filename)
+            else:
+                logger.info("Loading existing vector store")
+                await self.vector_store_service.load_vector_store(self.config.VECTOR_STORE_PATH)
+            
+            logger.info("Vector store operation completed", pdf_path=pdf_path)
+        except Exception as e:
+            logger.exception("Error in load_or_create_vector_store", exc_info=True)
+            logger.error("Error details", error_message=str(e))
+            raise QASystemError(f"Error processing document: {str(e)}")
+
+    async def list_documents(self) -> list:
+        try:
+            return await self.document_service.list_documents()
+        except Exception as e:
+            logger.exception("Error in list_documents", error=str(e))
+            raise QASystemError(f"Error listing documents: {str(e)}")
+
+    @handle_errors
+    async def get_session_info(self, session_id: str) -> dict:
+        try:
+            uuid.UUID(session_id)
+            conversation_history = await self.conversation_manager.get_conversation(
+                session_id
+            )
+            if not conversation_history:
+                return None
+            return {
+                "session_id": session_id,
+                "conversation_history": conversation_history,
+                "message_count": len(conversation_history),
+            }
+        except ValueError:
+            logger.error("Invalid session ID format", session_id=session_id)
+            raise QASystemError("INVALID SESSION ID FORMAT OR DOES NOT EXIST")
+
+    async def get_last_pdf(self) -> str:
+        return await self.document_service.get_last_processed_pdf()
+# document_tracker.py
+import sqlite3
+import hashlib
+import asyncio
+import aiosqlite
+import aiofiles
+
+class DocumentTracker:
+    """Tracks processed documents using an SQLite database."""
+
+    def __init__(self, db_path="processed_documents.db"):
+        """Initializes the DocumentTracker with a database connection."""
+        self.db_path = db_path
+        # Do not call async methods here
+
+    async def initialize(self):
+        """Initializes the DocumentTracker asynchronously."""
+        await self.create_table()
+
+    async def create_table(self):
+        """Creates the documents table if it doesn't exist."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS documents (
+                    id INTEGER PRIMARY KEY,
+                    file_hash TEXT UNIQUE,
+                    file_path TEXT,
+                    file_name TEXT,
+                    processed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            await db.commit()
+
+    async def get_file_hash(self, file_path):
+        """Generates an MD5 hash for the given file."""
+        async with aiofiles.open(file_path, "rb") as file:
+            content = await file.read()
+            return hashlib.md5(content).hexdigest()
+
+    async def is_document_processed(self, file_path):
+        """Checks if a document has already been processed."""
+        file_hash = await self.get_file_hash(file_path)
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT * FROM documents WHERE file_hash = ?", (file_hash,)) as cursor:
+                result = await cursor.fetchone()
+                return result is not None
+
+    async def add_document(self, file_path, file_name):
+        """Adds a document's details to the database."""
+        file_hash = await self.get_file_hash(file_path)
+        
+        # Check if the document already exists before trying to insert
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT 1 FROM documents WHERE file_hash = ?", (file_hash,)) as cursor:
+                result = await cursor.fetchone()
+            
+            if result:
+                # Document already exists, handle it (e.g., log or skip)
+                logger.info(f"Document already exists in the tracker: {file_name}")
+                return  # Skip the insertion to avoid the UNIQUE constraint error
+
+            # Insert the document if it doesn't exist
+            await db.execute(
+                "INSERT INTO documents (file_hash, file_path, file_name) VALUES (?, ?, ?)",
+                (file_hash, file_path, file_name),
+            )
+            await db.commit()
+
+    async def get_all_documents(self):
+        """Retrieves the names of all processed documents."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT file_name FROM documents") as cursor:
+                rows = await cursor.fetchall()
+                return [row[0] for row in rows]
+
+    async def close(self):
+        """Closes the database connection."""
+        if hasattr(self, 'conn') and self.conn:
+            await self.conn.close()
+
+    async def __aenter__(self):
+        """Async context manager enter method."""
+        await self.initialize()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit method."""
+        await self.close()
+
+# llm_handler.py
+from typing import Dict
+import logging
+from src.config import Config
+from src.llm_providers.llm_factory import LLMFactory
+from src.core.conversation_manager import ConversationManager
+from src.utils.error_handler import handle_errors
+from textstat import flesch_reading_ease
+import json
+import structlog
+from src.utils.logging_configs import configure_logging
+import asyncio
+from src.llm_providers.ollama_provider import OllamaProvider
+
+configure_logging()
+logger = structlog.get_logger(__name__)
+
+
+class LLMHandler:
+    """Handles LLM provider interactions and conversation management."""
+
+    def __init__(self, config: Config, llm_provider=None, conversation_manager=None):
+        """Initializes LLMHandler with config, LLM provider, and conversation manager."""
+        self.config = config
+        self.llm_provider = llm_provider or LLMFactory.get_provider(config)
+        self.conversation_manager = conversation_manager or ConversationManager()
+        self.ollama_provider = OllamaProvider(config)  #
+
+    @handle_errors
+    async def generate_response(
+        self, session_id: str, context: str, question: str
+    ) -> Dict[str, str]:
+        """Generates a response from the LLM based on context, question, and conversation history."""
+        try:
+            # Parse the context JSON and format the context for the LLM
+            context_data = json.loads(context)
+            formatted_context = self._format_context(context_data)
+
+            # Get the conversation history summary for the session (this is a synchronous call)
+            conversation_history = self.conversation_manager.get_conversation_summary(
+                session_id
+            )
+
+            # Create the initial prompt for the LLM
+            prompt = self._create_prompt(
+                formatted_context, question, conversation_history
+            )
+
+            # If Chain of Thoughts is enabled, modify the prompt
+            if self.config.CHAIN_OF_THOUGHTS_ENABLED:
+                prompt = self._add_chain_of_thoughts(prompt)
+
+            # If example prompts are provided, append them to the prompt
+            if self.config.EXAMPLE_PROMPTS:
+                prompt += "\n\nExamples:\n"
+                prompt += "\n".join(self.config.EXAMPLE_PROMPTS)
+
+            # Generate a response from the LLM
+            try:
+                response = await self.ollama_provider.generate_response(prompt)
+            except Exception as e:
+                logger.error(
+                    f"Failed to generate response from provider {self.llm_provider.get_provider_name()}: {e}"
+                )
+                return {"error": f"Failed to generate response: {e}"}
+
+            # Add the user question and LLM response to the conversation history (sync call)
+            self.conversation_manager.add_message(session_id, "user", question)
+            self.conversation_manager.add_message(session_id, "assistant", response)
+
+            # Evaluate the quality of the generated response
+            quality_score = self._evaluate_answer_quality(response)
+
+            return {
+                "answer": response,
+                "source": self.llm_provider.__class__.__name__,
+                "quality_score": quality_score,
+            }
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse context JSON: {e}")
+            raise
+        except Exception as e:
+            logger.exception(f"Unexpected error in generate_response: {str(e)}")
+            raise
+
+    def _create_prompt(
+        self, context: str, question: str, conversation_history: str
+    ) -> str:
+        """Creates a prompt using context, question, and conversation history."""
+
+        return f"""
+        Context: {context}
+
+        Conversation History:
+        {conversation_history}
+
+        Human: {question}
+
+        Assistant: Let me analyze the context and conversation history to provide an accurate answer.
+        """
+
+    def _add_chain_of_thoughts(self, prompt: str) -> str:
+        """
+        Adds a chain of thoughts to the prompt to guide the model's reasoning.
+        """
+        chain_of_thoughts_text = "\n".join(self.config.CHAIN_OF_THOUGHTS_PROMPT)
+
+        return f"""
+        {prompt}
+
+        Let's approach this step by step:
+
+        {chain_of_thoughts_text}
+        """
+
+    def _format_context(self, context_data):
+        """Formats context data into readable sections of text."""
+        formatted_context = ""
+        for item in context_data:
+            if item["type"] == "text":
+                formatted_context += (
+                    f"Header: {item['header']}\nContent: {item['content']}\n\n"
+                )
+            elif item["type"] == "table":
+                # Ensure that all headers are strings, replace None with empty strings if necessary
+                headers = [str(header) if header is not None else "" for header in item.get("headers", [])]
+                formatted_context += f"Table:\nHeaders: {', '.join(headers)}\n"
+                for row in item["data"]:
+                    formatted_context += f"{', '.join(map(str, row))}\n"
+                formatted_context += "\n"
+        return formatted_context
+
+
+    def _evaluate_answer_quality(self, answer: str, context: str = None) -> int:
+        """Evaluates the quality of the generated answer based on multiple factors."""
+        quality_score = 0
+
+        # Factor 1: Length of the answer
+        length_score = min(len(answer.split()) // 10, 5)  # Max 5 points for length
+        quality_score += length_score
+
+        # Factor 2: Keyword relevance
+        keywords = ["MONEYME", "financial", "loan", "income", "assets", "strategy"]
+        keyword_score = sum(keyword.lower() in answer.lower() for keyword in keywords)
+        keyword_score = min(keyword_score, 3)  # Max 3 points for keywords
+        quality_score += keyword_score
+
+        # Factor 3: Readability score
+        readability_score = flesch_reading_ease(answer)
+        if readability_score > 60:
+            quality_score += 2  # Max 2 points for readability
+
+        # Factor 4: Context relevance (if context is provided)
+        if context:
+            relevance_score = sum(
+                1 for word in answer.split() if word.lower() in context.lower()
+            )
+            relevance_score = min(
+                relevance_score // 5, 3
+            )  # Max 3 points for context relevance
+            quality_score += relevance_score
+
+        # Cap the total score at 10
+        return min(quality_score, 10)
+
+    @handle_errors
+    def clear_conversation(self, session_id: str):
+        """Clears the conversation history for the given session ID. -> not really used for now good to have for scalability"""
+        self.conversation_manager.clear_conversation(session_id)
+        logger.info(f"Cleared conversation history for session {session_id}")
+
+# conversation_manager.py
+from typing import List, Dict
+from collections import deque
+import time
+import asyncio
+
+class ConversationManager:
+    """Manage conversations for different sessions, handling message history and pruning old conversations."""
+
+    def __init__(self, max_history: int = 10):
+        """Initialize the conversation manager with a maximum history length for each session."""
+        self.max_history = max_history
+        self.conversations: Dict[str, deque] = {}
+
+    def add_message(self, session_id: str, role: str, content: str):
+        """Add a message to the conversation history for a specific session."""
+        if session_id not in self.conversations:
+            self.conversations[session_id] = deque(maxlen=self.max_history)
+
+        self.conversations[session_id].append(
+            {"role": role, "content": content, "timestamp": time.time()}
+        )
+
+    def get_conversation(self, session_id: str) -> List[Dict]:
+        """Retrieve the full conversation history for a specific session."""
+        return list(self.conversations.get(session_id, []))
+
+    def clear_conversation(self, session_id: str):
+        """Clear the conversation history for a specific session."""
+        if session_id in self.conversations:
+            del self.conversations[session_id]
+
+    def get_conversation_history(self, session_id: str) -> List[Dict]:
+        """Get the conversation history for a session, returning only role and content."""
+        conversation = self.get_conversation(session_id)
+        return [
+            {"role": msg["role"], "content": msg["content"]} for msg in conversation
+        ]
+
+    def get_conversation_summary(self, session_id: str) -> str:
+        """Generate a summary of the conversation for a specific session."""
+        conversation = self.get_conversation(session_id)
+        summary = []
+        for message in conversation:
+            role = "Human" if message["role"] == "user" else "AI"
+            summary.append(f"{role}: {message['content']}")
+        return "\n".join(summary)
+
+
+# __init__.py
+
+# logging_configs.py
+import logging
+import structlog
+
+def configure_logging():
+    # Set up basic logging configuration to a file
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler("app.log"),  # Log output to app.log
+            logging.StreamHandler(),  # Log output to console
+        ]
+    )
+
+    structlog.configure(
+        processors=[
+            structlog.stdlib.filter_by_level,
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.UnicodeDecoder(),
+            structlog.processors.JSONRenderer(),
+        ],
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+
+# error_handler.py
+import logging
+from functools import wraps
+import functools
+import aiofiles
+
+logger = logging.getLogger(__name__)
+
+
+class QASystemError(Exception):
+    """Base exception class for QA System errors."""
+    pass
+
+class VectorStoreError(QASystemError):
+    """Raised when there's an error with vector store operations."""
+    pass
+
+class DocumentProcessingError(QASystemError):
+    """Raised when there's an error processing a document."""
+    pass
+
+class LLMError(QASystemError):
+    """Raised when there's an error with the Language Model."""
+    pass
+
+class InvalidInputError(QASystemError):
+    """Raised when the input to a function is invalid."""
+    pass
+
+class ConfigurationError(QASystemError):
+    """Raised when there's an error in the system configuration."""
+    pass
+
+import structlog
+
+logger = structlog.get_logger(__name__)
+
+def handle_errors(func):
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except VectorStoreError as e:
+            logger.error("Vector store error", error_message=str(e))
+            raise
+        except DocumentProcessingError as e:
+            logger.error("Document processing error", error_message=str(e))
+            raise
+        except LLMError as e:
+            logger.error("Language Model error", error_message=str(e))
+            raise
+        except InvalidInputError as e:
+            logger.error("Invalid input error", error_message=str(e))
+            raise
+        except ConfigurationError as e:
+            logger.error("Configuration error", error_message=str(e))
+            raise
+        except Exception as e:
+            logger.exception("Unexpected error", error_message=str(e))
+            raise QASystemError(f"An unexpected error occurred: {str(e)}")
+    return wrapper
+# llm_provider_base.py
+from abc import ABC, abstractmethod
+
+
+class LLMProviderBase(ABC):
+    """Abstract base class for all LLM providers."""
+
+    @abstractmethod
+    def generate_response(self, prompt: str) -> str:
+        """Generates a response from the LLM based on the input prompt."""
+        pass
+
+    @abstractmethod
+    def get_model_name(self) -> str:
+        """Returns the name of the model used by the LLM provider."""
+        pass
+
+    @abstractmethod
+    def get_provider_name(self) -> str:
+        """Returns the name of the LLM provider."""
+        pass
+
+# __init__.py
+
+# openai_provider.py
+# src/llm_providers/openai_provider.py
+
+from openai import OpenAI
+import logging
+from src.config import Config
+from src.llm_providers.llm_provider_base import LLMProviderBase
+
+logger = logging.getLogger(__name__)
+
+
+class OpenAIProvider(LLMProviderBase):
+    """LLM provider for interacting with the OpenAI language model."""
+
+    def __init__(self, config: Config):
+        """Initializes the OpenAI provider with configuration and API key."""
+        self.config = config
+        self.client = OpenAI(api_key=self.config.OPENAI_API_KEY)
+        self.model = self.config.OPENAI_MODEL_NAME
+
+        logger.info(f"Initializing OpenAI with model: {self.model}")
+
+    def generate_response(self, prompt: str) -> str:
+        """Sends a prompt to the OpenAI model and returns the generated response."""
+        logger.info(
+            f"Sending prompt to OpenAI: {prompt[:100]}..."
+        )  # Log first 100 characters of prompt
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=150,
+            )
+            result = response.choices[0].message.content.strip()
+            logger.info(
+                f"Received response from OpenAI: {result[:100]}..."
+            )  # Log first 100 characters of response
+            return result
+        except Exception as e:
+            logger.error(f"Error generating response from OpenAI: {str(e)}")
+            return f"Error generating response: {str(e)}"
+
+    def get_model_name(self) -> str:
+        """Returns the name of the model used by OpenAI."""
+        return self.model
+
+    def get_provider_name(self) -> str:
+        """Returns the name of the LLM provider, which is 'OpenAI'."""
+        return "OpenAI"
+
+# ollama_provider.py
+# src/llm_providers/ollama_provider.py
+
+from langchain_community.llms import Ollama
+import structlog
+from src.config import Config
+from src.llm_providers.llm_provider_base import LLMProviderBase
+import asyncio
+
+logger = structlog.get_logger(__name__)
+
+class OllamaProvider(LLMProviderBase):
+    """LLM provider for interacting with the Ollama language model."""
+
+    def __init__(self, config: Config):
+        """Initializes the Ollama provider with configuration and model details."""
+        self.config = config
+        self.model_name = config.OLLAMA_MODEL_NAME
+        self.base_url = config.OLLAMA_BASE_URL
+
+        logger.info("Initializing Ollama", model=self.model_name, base_url=self.base_url)
+
+        self.llm = Ollama(model=self.model_name, base_url=self.base_url)
+
+    async def generate_response(self, prompt: str) -> str:
+        """Sends a prompt to the Ollama model and returns the generated response."""
+        logger.info("Sending prompt to Ollama", prompt_preview=prompt[:100])
+
+        try:
+            response = await asyncio.to_thread(self.llm.invoke, prompt)
+            logger.info("Received response from Ollama", response_preview=response[:100])
+            return response.strip()
+        except Exception as e:
+            logger.error("Error generating response from Ollama", error=str(e))
+            return f"Error generating response: {str(e)}"
+
+
+    def get_model_name(self) -> str:
+        """Returns the name of the model used by Ollama."""
+        return self.model_name
+
+    def get_provider_name(self) -> str:
+        """Returns the name of the LLM provider, which is 'Ollama'."""
+        return "Ollama"
+# llm_factory.py
+# src/llm_providers/llm_factory.py
+
+from src.config import Config
+
+
+class LLMFactory:
+    @staticmethod
+    def get_provider(config: Config):
+        if config.LLM_PROVIDER == "openai":
+            from src.llm_providers.openai_provider import OpenAIProvider
+
+            return OpenAIProvider(config)
+        elif config.LLM_PROVIDER == "ollama":
+            from src.llm_providers.ollama_provider import OllamaProvider
+
+            return OllamaProvider(config)
+        else:
+            raise ValueError(f"Unsupported LLM provider: {config.LLM_PROVIDER}")
+
+    @staticmethod
+    def list_available_providers():
+        return ["openai", "ollama"]
+
+# __init__.py
+
+# app.py
+from fastapi import FastAPI, HTTPException, Header, Query, Depends, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, UUID4, validator
+from typing import List, Optional
+from src.core.qa_system import QASystem
+from src.config import Config
+from src.utils.error_handler import QASystemError
+import os
+import uuid
+import logging
+import tempfile
+import asyncio
+
+
+"""Create a FastAPI instance for the MONEYME AI Q&A API."""
+app = FastAPI(title="MONEYME AI Q&A API")
+
+"""Add CORS middleware to allow cross-origin requests from all origins."""
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class QueryRequest(BaseModel):
+    """Request model for a single query containing a question."""
+
+    question: str
+
+
+class QueryResponse(BaseModel):
+    """Response model for a query, returning the answer, source, and quality score."""
+
+    answer: str
+    source: str
+    quality_score: int
+
+
+class ChatExchange(BaseModel):
+    """Model representing a single exchange in a chat session, with role and content."""
+
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    """Request model for a chat session, including an optional session ID and question."""
+
+    session_id: Optional[str] = None
+    question: str
+
+    @validator("session_id")
+    def validate_session_id(cls, v):
+        """Validate the session ID, ensuring it's either None or a non-empty string."""
+        if v in [None, "", "{{}}"] or (isinstance(v, str) and v.strip() == ""):
+            return None
+        return v
+
+
+class ChatResponse(BaseModel):
+    """Response model for a chat query, including session ID, answer, source, quality score, and conversation history."""
+
+    session_id: UUID4
+    answer: str
+    source: str
+    quality_score: int
+    conversation_history: List[ChatExchange]
+
+
+class ErrorResponse(BaseModel):
+    """Model for an error response, containing a detailed error message."""
+
+    detail: str
+
+
+"""Load the configuration for the QA system & Initialize the QA system with the loaded configuration."""
+config = Config()
+qa_system = QASystem(config)
+
+logger = logging.getLogger(__name__)
+
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        vector_store_path = config.VECTOR_STORE_PATH
+        logger.info(f"Checking for vector store at path: {vector_store_path}")
+
+        if await qa_system.vector_store_service.vector_store_exists(vector_store_path):
+            await qa_system.vector_store_service.load_vector_store(vector_store_path)
+            last_pdf = await qa_system.get_last_pdf()
+            logger.info(f"Vector store loaded. Last processed PDF: {last_pdf}")
+            print(f"Vector store loaded. Last processed PDF: {last_pdf}")
+        else:
+            logger.info(f"No vector store found at {vector_store_path}")
+            print(
+                "No previous vector store found. The system is ready for a new PDF upload."
+            )
+    except Exception as e:
+        logger.error(f"Error during startup: {str(e)}")
+        print(f"Error during startup: {str(e)}")
+        
+
+@app.post(
+    "/query",
+    response_model=QueryResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+async def query(request: QueryRequest):
+    try:
+        if not await qa_system.vector_store_service.is_loaded():
+            raise HTTPException(
+                status_code=400,
+                detail="No PDF has been processed yet. Please upload a PDF first.",
+            )
+
+        result = await qa_system.process_single_query(request.question)
+        return QueryResponse(
+            answer=result["answer"],
+            source=result["source"],
+            quality_score=result["quality_score"],
+        )
+    except HTTPException:
+        raise
+    except QASystemError as e:
+        logger.error(f"QASystemError in query: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Unexpected error in query", exc_info=True)
+        logger.error(f"Error details: {str(e)}")
+        raise HTTPException(status_code=500, detail="An internal server error occurred")
+
+
+@app.post(
+    "/chat",
+    response_model=ChatResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+async def chat(request: ChatRequest):
+    try:
+        if not await qa_system.vector_store_service.is_loaded():
+            raise HTTPException(
+                status_code=400,
+                detail="No PDF has been processed yet. Please upload a PDF first.",
+            )
+
+        result = await qa_system.process_chat_query(request.session_id, request.question)
+        return ChatResponse(
+            session_id=result["session_id"],
+            answer=result["answer"],
+            source=result["source"],
+            quality_score=result["quality_score"],
+            conversation_history=result["conversation_history"],
+        )
+    except HTTPException:
+        raise
+    except QASystemError as e:
+        logger.error(f"QASystemError in chat: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Unexpected error in chat", exc_info=True)
+        logger.error(f"Error details: {str(e)}")
+        raise HTTPException(status_code=500, detail="An internal server error occurred")
+
+
+@app.post(
+    "/upload_pdf",
+    responses={
+        200: {"model": dict},
+        400: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def upload_pdf(file: UploadFile = File(...)):
+    try:
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Uploaded file must be a PDF")
+
+        os.makedirs(config.UPLOAD_DIRECTORY, exist_ok=True)
+        file_path = os.path.join(config.UPLOAD_DIRECTORY, file.filename)
+
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+
+        task = asyncio.create_task(qa_system.load_or_create_vector_store(file_path, file.filename))
+        
+        return {
+            "message": f"PDF upload started. Processing in background: {file.filename}"
+        }
+
+    except QASystemError as e:
+        logger.error(f"QASystemError in upload_pdf: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Error processing PDF", exc_info=True)
+        logger.error(f"Error details: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error processing PDF")
+
+
+@app.get(
+    "/list_documents", responses={200: {"model": dict}, 500: {"model": ErrorResponse}}
+)
+async def list_documents():
+    try:
+        documents = await qa_system.list_documents()
+        return {"documents": documents}
+    except Exception as e:
+        logger.exception("Error listing documents", exc_info=True)
+        logger.error(f"Error details: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error listing documents")
+
+
+
+@app.get("/", responses={200: {"model": dict}})
+async def root():
+    return {"message": "Welcome to the MONEYME AI Q&A API"}
+
